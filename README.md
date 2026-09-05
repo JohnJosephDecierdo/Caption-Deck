@@ -17,6 +17,8 @@ Just open `index.html` in a modern browser (Chrome or Edge recommended for full 
 
 To host it as a live site, deploy this repo as-is to Netlify, Vercel, GitHub Pages, or any static host — `index.html` is the entry point.
 
+Once hosted, the site is installable (Add to Home Screen / Install App) and works offline after your first visit — `manifest.json` and `sw.js` handle that. If you edit `index.html` later, bump `CACHE_NAME` at the top of `sw.js` (e.g. `caption-deck-v2`) so visitors' browsers pick up the update instead of serving a cached old copy.
+
 ## Notes & limitations
 
 - YouTube/TikTok/Instagram links can't be loaded directly — download the video file first, then upload it here. No browser-only tool can pull video from those platforms without breaking their Terms of Service.

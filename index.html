@@ -4,6 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Caption Deck</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#12141c">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
 <style>
   :root{
     --ink:#12141c;
@@ -482,6 +486,11 @@
   function buildWordTimeline(){
     const words = [];
     cues.forEach(c=>{
+      // Use real Whisper word-level timestamps when available and we're showing the original text unedited.
+      if(style.source === 'text' && c.words && c.words.length){
+        c.words.forEach(w => words.push({text:w.text, start:w.start, end:w.end}));
+        return;
+      }
       const src = (style.source==='trans' ? c.trans : c.text) || '';
       const list = src.trim().split(/\s+/).filter(Boolean);
       if(!list.length) return;
@@ -557,9 +566,9 @@
         <textarea class="orig-text" placeholder="Original text">${c.text}</textarea>
         <textarea class="trans-text" placeholder="Translation appears here">${c.trans||''}</textarea>
       `;
-      row.querySelector('.startInp').addEventListener('change', e=>{ c.start = parseClock(e.target.value); rebuildPages(); });
-      row.querySelector('.endInp').addEventListener('change', e=>{ c.end = parseClock(e.target.value); rebuildPages(); });
-      row.querySelector('.orig-text').addEventListener('input', e=>{ c.text = e.target.value; rebuildPages(); });
+      row.querySelector('.startInp').addEventListener('change', e=>{ c.start = parseClock(e.target.value); delete c.words; rebuildPages(); });
+      row.querySelector('.endInp').addEventListener('change', e=>{ c.end = parseClock(e.target.value); delete c.words; rebuildPages(); });
+      row.querySelector('.orig-text').addEventListener('input', e=>{ c.text = e.target.value; delete c.words; rebuildPages(); });
       row.querySelector('.trans-text').addEventListener('input', e=>{ c.trans = e.target.value; rebuildPages(); });
       row.querySelector('.delBtn').addEventListener('click', ()=>{ cues.splice(i,1); renderCues(); });
       row.querySelector('.startInp').addEventListener('click', ()=>{ video.currentTime = c.start; });
@@ -570,7 +579,11 @@
 
   function shiftAllCues(delta){
     if(!cues.length){ toast('No captions to shift', true); return; }
-    cues.forEach(c=>{ c.start = Math.max(0, c.start + delta); c.end = Math.max(c.start+0.05, c.end + delta); });
+    cues.forEach(c=>{
+      c.start = Math.max(0, c.start + delta);
+      c.end = Math.max(c.start+0.05, c.end + delta);
+      if(c.words) c.words.forEach(w=>{ w.start = Math.max(0, w.start+delta); w.end = Math.max(w.start+0.02, w.end+delta); });
+    });
     renderCues();
     toast(`Shifted all captions by ${delta>0?'+':''}${delta.toFixed(2)}s`);
   }
@@ -888,6 +901,33 @@
   }
 
   let asrPipe = null, asrPipeModel = null;
+  function groupWordsIntoCues(wordChunks){
+    const PAUSE_BREAK = 0.6, MAX_WORDS = 14;
+    const out = [];
+    let cur = null;
+    wordChunks.forEach(w=>{
+      const text = (w.text||'').trim();
+      if(!text) return;
+      const start = (w.timestamp && w.timestamp[0]!=null) ? w.timestamp[0] : (cur?cur.end:0);
+      const end = (w.timestamp && w.timestamp[1]!=null) ? w.timestamp[1] : start+0.3;
+      if(!cur){
+        cur = {start, end, text, words:[{text,start,end}]};
+      }else{
+        const gap = start - cur.end;
+        const endsSentence = /[.!?…]$/.test(cur.text);
+        if(gap > PAUSE_BREAK || cur.words.length >= MAX_WORDS || endsSentence){
+          out.push(cur);
+          cur = {start, end, text, words:[{text,start,end}]};
+        }else{
+          cur.end = end;
+          cur.text += ' ' + text;
+          cur.words.push({text,start,end});
+        }
+      }
+    });
+    if(cur) out.push(cur);
+    return out.map(c=>({start:c.start, end:c.end, text:c.text.trim(), trans:'', words:c.words}));
+  }
   $('transcribeBtn').addEventListener('click', transcribeInBrowser);
   async function transcribeInBrowser(){
     if(!video.src){ toast('Load a video first', true); return; }
@@ -942,18 +982,19 @@
       statusEl.textContent = 'Transcribing… starting up the model…';
 
       const result = await asrPipe(pcm, {
-        return_timestamps:true, chunk_length_s:30, stride_length_s:5,
+        return_timestamps:'word', chunk_length_s:30, stride_length_s:5,
         chunk_callback: ()=>{ /* best-effort; not all versions invoke this, elapsed timer above covers the rest */ }
       });
 
       clearInterval(elapsedTimer); elapsedTimer=null;
 
-      const rawChunks = result.chunks && result.chunks.length ? result.chunks : [{text: result.text, timestamp:[0, videoDuration||10]}];
-      cues = rawChunks.map(c=>{
-        const start = c.timestamp && c.timestamp[0] != null ? c.timestamp[0] : 0;
-        const end = c.timestamp && c.timestamp[1] != null ? c.timestamp[1] : start + 3;
-        return {start, end, text:(c.text||'').trim(), trans:''};
-      }).filter(c=>c.text);
+      const wordChunks = (result.chunks && result.chunks.length) ? result.chunks : null;
+      if(wordChunks){
+        cues = groupWordsIntoCues(wordChunks);
+      }else{
+        // fallback for older/unsupported word-timestamp responses
+        cues = [{start:0, end: videoDuration||10, text:(result.text||'').trim(), trans:''}].filter(c=>c.text);
+      }
 
       renderCues();
       setStep(3);
@@ -971,6 +1012,13 @@
 
   renderCues();
 })();
+</script>
+<script>
+  if('serviceWorker' in navigator){
+    window.addEventListener('load', ()=>{
+      navigator.serviceWorker.register('sw.js').catch(()=>{ /* offline support unavailable, app still works online */ });
+    });
+  }
 </script>
 </body>
 </html>
