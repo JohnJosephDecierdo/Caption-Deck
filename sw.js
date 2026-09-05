@@ -3,7 +3,7 @@
 // IMPORTANT: bump CACHE_NAME (e.g. 'caption-deck-v2') any time you update index.html and
 // re-upload it to GitHub. Otherwise visitors' browsers may keep serving the old cached
 // version instead of picking up your changes.
-const CACHE_NAME = 'caption-deck-v1';
+const CACHE_NAME = 'caption-deck-v2';
 const SHELL_FILES = [
   './',
   './index.html',

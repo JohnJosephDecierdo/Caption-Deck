@@ -239,7 +239,7 @@
         <div class="progress-wrap" id="progWrap"><div class="progress-bar" id="progBar"></div></div>
         <span class="hint" id="burnStatus"></span>
       </div>
-      <div class="hint">Export keeps your source resolution (4K in → 4K out) with bitrate scaled up accordingly, and saves as MP4 where your browser supports it (Chrome, Edge, Safari), falling back to WebM otherwise. It renders in real time — a 4K clip on a slower device may take a little longer than its own runtime to export.</div>
+      <div class="hint">Export keeps your source resolution (4K in → 4K out) with bitrate scaled up accordingly, and saves as MP4 where your browser supports it (Chrome, Edge, Safari), falling back to WebM otherwise. It renders in real time — a 4K clip on a slower device may take a little longer than its own runtime to export. If "Live-translate" is on, it'll keep translating just ahead of the export too — for a smooth burn, run "Translate all" first on anything you plan to export, so nothing's left waiting on a network call mid-render.</div>
     </div>
 
     <div class="cue-col">
@@ -248,6 +248,10 @@
         <div class="lang-bar">
           <select id="targetLang"></select>
           <button class="primary" id="translateBtn">Translate all</button>
+        </div>
+        <div class="chk" style="margin-top:2px;">
+          <input type="checkbox" id="liveTranslateToggle">
+          <label for="liveTranslateToggle" style="color:var(--text);">🔄 Live-translate as it plays (translates a few seconds ahead, in the background)</label>
         </div>
         <div class="hint" id="translateStatus"></div>
       </div>
@@ -536,8 +540,34 @@
     });
   }
 
+  let liveTranslateOn = false;
+  const liveInFlight = new Set();
+  $('liveTranslateToggle').addEventListener('change', e=>{
+    liveTranslateOn = e.target.checked;
+    if(liveTranslateOn) maybeLiveTranslate();
+  });
+  function maybeLiveTranslate(){
+    if(!liveTranslateOn || !cues.length) return;
+    const tl = langSel.value;
+    const t = video.currentTime;
+    const LOOKAHEAD = 8; // seconds — translate cues arriving within this window
+    cues.forEach((c,i)=>{
+      if(c.trans || liveInFlight.has(i)) return;
+      if(c.end >= t - 1 && c.start <= t + LOOKAHEAD){
+        liveInFlight.add(i);
+        translateOne(c.text, tl).then(tr=>{
+          c.trans = tr;
+          setCueTransDOM(i, tr);
+          if(style.source === 'trans') rebuildPages();
+        }).catch(()=>{ /* will retry next tick since c.trans stays empty */ })
+          .finally(()=> liveInFlight.delete(i));
+      }
+    });
+  }
+
   video.addEventListener('timeupdate', ()=>{
     renderOverlayAt(video.currentTime);
+    maybeLiveTranslate();
     const page = pageAt(video.currentTime);
     document.querySelectorAll('.cue').forEach(el=>el.classList.remove('active'));
     if(page){
