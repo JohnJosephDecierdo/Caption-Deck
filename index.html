@@ -243,6 +243,16 @@
     </div>
 
     <div class="cue-col">
+      <div class="cue-head" id="restoreBanner" style="display:none;background:var(--teal-dim);border-bottom:1px solid var(--teal);">
+        <div class="row1">
+          <span class="hint" id="restoreText" style="color:var(--text);"></span>
+        </div>
+        <div class="field-row">
+          <button class="small primary" id="restoreBtn">Restore</button>
+          <button class="small ghost" id="discardBtn">Discard</button>
+        </div>
+      </div>
+
       <div class="cue-head">
         <div class="row1"><h2>Captions</h2></div>
         <div class="lang-bar">
@@ -474,15 +484,16 @@
   });
 
   /* ---------------- caption style controls ---------------- */
-  $('capSource').addEventListener('change', e=>{ style.source = e.target.value; rebuildPages(); });
-  $('capPosition').addEventListener('change', e=>{ style.position = e.target.value; overlay.className = 'cap-overlay pos-'+style.position; });
-  $('capWords').addEventListener('change', e=>{ style.wordsPerGroup = parseInt(e.target.value); rebuildPages(); });
-  $('capUpper').addEventListener('change', e=>{ style.uppercase = e.target.checked; });
+  $('capSource').addEventListener('change', e=>{ style.source = e.target.value; rebuildPages(); scheduleSave(); });
+  $('capPosition').addEventListener('change', e=>{ style.position = e.target.value; overlay.className = 'cap-overlay pos-'+style.position; scheduleSave(); });
+  $('capWords').addEventListener('change', e=>{ style.wordsPerGroup = parseInt(e.target.value); rebuildPages(); scheduleSave(); });
+  $('capUpper').addEventListener('change', e=>{ style.uppercase = e.target.checked; scheduleSave(); });
   document.querySelectorAll('#swatches .swatch').forEach(sw=>{
     sw.addEventListener('click', ()=>{
       document.querySelectorAll('#swatches .swatch').forEach(s=>s.classList.remove('sel'));
       sw.classList.add('sel');
       style.highlight = sw.dataset.c;
+      scheduleSave();
     });
   });
 
@@ -559,6 +570,7 @@
           c.trans = tr;
           setCueTransDOM(i, tr);
           if(style.source === 'trans') rebuildPages();
+          scheduleSave();
         }).catch(()=>{ /* will retry next tick since c.trans stays empty */ })
           .finally(()=> liveInFlight.delete(i));
       }
@@ -577,7 +589,57 @@
   });
 
   /* ---------------- cue list rendering ---------------- */
+  /* ---------------- autosave (localStorage) ---------------- */
+  const AUTOSAVE_KEY = 'captionDeckAutosave_v1';
+  let saveTimer = null;
+  function scheduleSave(){
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveState, 800);
+  }
+  function saveState(){
+    if(!cues.length) return; // don't clobber a pending restore with an empty state
+    try{
+      localStorage.setItem(AUTOSAVE_KEY, JSON.stringify({
+        cues, style, targetLang: langSel.value, savedAt: Date.now()
+      }));
+    }catch(e){ /* storage unavailable or full — silently skip, nothing critical depends on it */ }
+  }
+  function tryLoadAutosave(){
+    let raw;
+    try{ raw = localStorage.getItem(AUTOSAVE_KEY); }catch(e){ return; }
+    if(!raw) return;
+    let data;
+    try{ data = JSON.parse(raw); }catch(e){ return; }
+    if(!data || !Array.isArray(data.cues) || !data.cues.length) return;
+    const banner = $('restoreBanner');
+    const mins = Math.max(0, Math.round((Date.now()-(data.savedAt||0))/60000));
+    $('restoreText').textContent = `Found ${data.cues.length} unsaved captions from ${mins<1?'just now':mins+' min ago'}. Load your video again, then restore them.`;
+    banner.style.display = 'flex';
+    banner.style.flexDirection = 'column';
+    banner.style.gap = '8px';
+    $('restoreBtn').onclick = ()=>{
+      cues = data.cues;
+      if(data.style) Object.assign(style, data.style);
+      if(data.targetLang) langSel.value = data.targetLang;
+      $('capSource').value = style.source;
+      $('capPosition').value = style.position;
+      $('capWords').value = style.wordsPerGroup;
+      $('capUpper').checked = style.uppercase;
+      document.querySelectorAll('#swatches .swatch').forEach(s=> s.classList.toggle('sel', s.dataset.c === style.highlight));
+      overlay.className = 'cap-overlay pos-' + style.position;
+      renderCues();
+      banner.style.display = 'none';
+      toast('Captions restored — load your video to continue');
+    };
+    $('discardBtn').onclick = ()=>{
+      try{ localStorage.removeItem(AUTOSAVE_KEY); }catch(e){}
+      banner.style.display = 'none';
+    };
+  }
+  setInterval(()=>{ if(cues.length) saveState(); }, 8000); // safety net in case a mutation point is missed
+
   function renderCues(){
+    scheduleSave();
     cueList.innerHTML = '';
     if(!cues.length){ cueList.appendChild(cueEmpty); rebuildPages(); return; }
     cues.forEach((c, i)=>{
@@ -636,6 +698,7 @@
   $('clearBtn').addEventListener('click', ()=>{
     if(cues.length && !confirm('Clear all cues?')) return;
     cues = []; renderCues();
+    try{ localStorage.removeItem(AUTOSAVE_KEY); }catch(e){}
   });
 
   $('subInput').addEventListener('change', async (e)=>{
@@ -716,6 +779,7 @@
     try{
       await Promise.all(Array.from({length: Math.min(CONCURRENCY, cues.length)}, worker));
       rebuildPages();
+      scheduleSave();
       if(failed){
         statusEl.textContent = `Done — ${cues.length-failed} translated, ${failed} failed. Hit "Translate all" again to retry the rest.`;
         toast('Translation finished with some failures', true);
@@ -1040,6 +1104,7 @@
     }
   }
 
+  tryLoadAutosave();
   renderCues();
 })();
 </script>
