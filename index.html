@@ -87,7 +87,7 @@
     display:inline-block;
   }
   .cap-word.uc{text-transform:uppercase;}
-  .cap-word.active{transform:scale(1.14);}
+  .cap-word.active{font-size:1.16em;}
 
   .style-panel{
     display:flex;flex-wrap:wrap;gap:10px;align-items:center;
@@ -841,21 +841,27 @@
   function drawCaptionOnCanvas(ctx, W, H, page, t){
     if(!page) return;
     const ai = activeWordIndex(page, t);
-    const fontSize = Math.max(22, Math.min(64, W*0.05));
-    const gap = fontSize*0.28;
+    const baseFontSize = Math.max(22, Math.min(64, W*0.05));
+    const gap = baseFontSize*0.28;
     ctx.textBaseline = 'alphabetic';
     ctx.lineJoin = 'round';
+    const fontFamily = getComputedStyle(document.body).fontFamily;
     const words = page.words.map(w => style.uppercase ? w.text.toUpperCase() : w.text);
-    ctx.font = `800 ${fontSize}px ${getComputedStyle(document.body).fontFamily}`;
-    const widths = words.map(w=>ctx.measureText(w).width);
+    const sizes = words.map((w,i)=> i===ai ? baseFontSize*1.16 : baseFontSize);
+    // Measure each word at the size it will actually render at (the active word is bigger),
+    // so spacing/positioning is based on real widths — this is what caused words to crash
+    // into each other before: widths were measured at one size but drawn at another.
+    const widths = words.map((w,i)=>{
+      ctx.font = `800 ${sizes[i]}px ${fontFamily}`;
+      return ctx.measureText(w).width;
+    });
     const totalW = widths.reduce((a,b)=>a+b,0) + gap*(words.length-1);
     let x = (W-totalW)/2;
     const y = style.position==='bottom' ? H*0.86 : style.position==='top' ? H*0.14 : H*0.5;
     words.forEach((w,i)=>{
       const active = i===ai;
-      const fs = active ? fontSize*1.12 : fontSize;
-      ctx.font = `800 ${fs}px ${getComputedStyle(document.body).fontFamily}`;
-      ctx.lineWidth = fs*0.11;
+      ctx.font = `800 ${sizes[i]}px ${fontFamily}`;
+      ctx.lineWidth = sizes[i]*0.11;
       ctx.strokeStyle = 'rgba(0,0,0,0.9)';
       ctx.fillStyle = active ? style.highlight : '#ffffff';
       ctx.strokeText(w, x, y);
@@ -994,7 +1000,33 @@
     return out;
   }
 
-  let asrPipe = null, asrPipeModel = null;
+  let asrWorker = null;
+  function getAsrWorker(){
+    if(!asrWorker){
+      asrWorker = new Worker('asr-worker.js', {type:'module'});
+    }
+    return asrWorker;
+  }
+  function runWhisperInWorker(pcm, modelSize, onEvent){
+    return new Promise((resolve, reject)=>{
+      const worker = getAsrWorker();
+      function handler(e){
+        const msg = e.data;
+        if(msg.type === 'done'){
+          worker.removeEventListener('message', handler);
+          resolve(msg.result);
+        }else if(msg.type === 'error'){
+          worker.removeEventListener('message', handler);
+          reject(new Error(msg.message));
+        }else{
+          onEvent && onEvent(msg);
+        }
+      }
+      worker.addEventListener('message', handler);
+      // Transfer the buffer instead of copying it — cheap even for long audio.
+      worker.postMessage({type:'transcribe', modelSize, pcm}, [pcm.buffer]);
+    });
+  }
   function groupWordsIntoCues(wordChunks){
     const PAUSE_BREAK = 0.6, MAX_WORDS = 14;
     const out = [];
@@ -1049,46 +1081,20 @@
       const pcm = await blobToMonoPCM16k(audioBlob);
 
       statusEl.textContent = 'Loading Whisper (first run downloads it, then it is cached in your browser)…';
-      const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2');
-      // Multi-threaded WASM needs special cross-origin isolation headers that most static
-      // hosts (GitHub Pages included) can't set. Force single-threaded WASM so the CPU
-      // fallback actually works everywhere, not just on hosts with those headers configured.
-      try{ env.backends.onnx.wasm.numThreads = 1; }catch(e){}
-
-      if(!asrPipe || asrPipeModel !== modelSize){
-        const progressCb = (p)=>{
-          if(p.status === 'progress'){
-            statusEl.textContent = `Downloading model (${p.file || 'weights'})… ${Math.round(p.progress||0)}%`;
-          }
-        };
-        // Skip WebGPU entirely for devices without a dedicated GPU adapter, and try the
-        // two known non-GPU device identifiers this library version might expect.
-        let lastErr = null;
-        for(const dev of ['cpu','wasm', undefined]){
-          try{
-            asrPipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-'+modelSize, dev ? {device:dev, progress_callback: progressCb} : {progress_callback: progressCb});
-            lastErr = null;
-            break;
-          }catch(e){ lastErr = e; }
-        }
-        if(lastErr){
-          throw new Error('No working CPU backend found in this browser for this ML library — this looks like a compatibility issue with this specific library/browser combo, not your video or your computer generally. Subtitle Edit will work fine as an alternative: ' + (lastErr.message || lastErr));
-        }
-        asrPipeModel = modelSize;
-      }
-
-      const audioSeconds = pcm.length / 16000;
-      let processedSeconds = 0;
       const startedAt = Date.now();
       const fmtElapsed = (ms)=>{ const s=Math.round(ms/1000); return Math.floor(s/60)+'m '+(s%60)+'s'; };
       elapsedTimer = setInterval(()=>{
-        statusEl.textContent = `Transcribing… ${fmtElapsed(Date.now()-startedAt)} elapsed (no fixed end time — depends on your device). This tab is still working, not frozen.`;
+        statusEl.textContent = `Working… ${fmtElapsed(Date.now()-startedAt)} elapsed (no fixed end time — depends on your device). The page stays responsive now — this runs in the background.`;
       }, 1000);
-      statusEl.textContent = 'Transcribing… starting up the model…';
 
-      const result = await asrPipe(pcm, {
-        return_timestamps:'word', chunk_length_s:30, stride_length_s:5,
-        chunk_callback: ()=>{ /* best-effort; not all versions invoke this, elapsed timer above covers the rest */ }
+      // Runs in a Web Worker (a background thread) so the page — video preview, buttons,
+      // this status text — stays fully responsive instead of freezing during transcription.
+      const result = await runWhisperInWorker(pcm, modelSize, (msg)=>{
+        if(msg.type === 'progress'){
+          statusEl.textContent = `Downloading model (${msg.file || 'weights'})… ${Math.round(msg.progress||0)}%`;
+        }else if(msg.type === 'status'){
+          statusEl.textContent = msg.text;
+        }
       });
 
       clearInterval(elapsedTimer); elapsedTimer=null;

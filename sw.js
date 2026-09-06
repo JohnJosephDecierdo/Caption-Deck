@@ -1,15 +1,16 @@
 // Caption Deck service worker — caches the app shell so it loads offline after the first visit.
 //
-// IMPORTANT: bump CACHE_NAME (e.g. 'caption-deck-v5') any time you update index.html and
+// IMPORTANT: bump CACHE_NAME (e.g. 'caption-deck-v6') any time you update index.html and
 // re-upload it to GitHub. Otherwise visitors' browsers may keep serving the old cached
 // version instead of picking up your changes.
-const CACHE_NAME = 'caption-deck-v5';
+const CACHE_NAME = 'caption-deck-v6';
 const SHELL_FILES = [
   './',
   './index.html',
   './manifest.json',
   './icon-192.png',
-  './icon-512.png'
+  './icon-512.png',
+  './asr-worker.js'
 ];
 
 self.addEventListener('install', (event) => {
