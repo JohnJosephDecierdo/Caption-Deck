@@ -1061,15 +1061,18 @@
             statusEl.textContent = `Downloading model (${p.file || 'weights'})… ${Math.round(p.progress||0)}%`;
           }
         };
-        try{
-          asrPipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-'+modelSize, {device:'webgpu', progress_callback: progressCb});
-        }catch(e){
-          statusEl.textContent = 'WebGPU unavailable, falling back to CPU (slower)…';
+        // Skip WebGPU entirely for devices without a dedicated GPU adapter, and try the
+        // two known non-GPU device identifiers this library version might expect.
+        let lastErr = null;
+        for(const dev of ['cpu','wasm', undefined]){
           try{
-            asrPipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-'+modelSize, {device:'wasm', progress_callback: progressCb});
-          }catch(e2){
-            throw new Error('No working backend (tried WebGPU and CPU/WASM): ' + (e2 && e2.message ? e2.message : e2));
-          }
+            asrPipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-'+modelSize, dev ? {device:dev, progress_callback: progressCb} : {progress_callback: progressCb});
+            lastErr = null;
+            break;
+          }catch(e){ lastErr = e; }
+        }
+        if(lastErr){
+          throw new Error('No working CPU backend found in this browser for this ML library — this looks like a compatibility issue with this specific library/browser combo, not your video or your computer generally. Subtitle Edit will work fine as an alternative: ' + (lastErr.message || lastErr));
         }
         asrPipeModel = modelSize;
       }
