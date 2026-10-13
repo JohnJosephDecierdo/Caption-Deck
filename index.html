@@ -239,15 +239,13 @@
 
       <div class="export-row">
         <button class="burn" id="burnBtn">Burn captions &amp; download video</button>
-        <select id="exportRes" title="Export resolution — lower is smoother on slower computers">
-          <option value="1080" selected>Max 1080p (smoother)</option>
-          <option value="720">Max 720p (smoothest)</option>
-          <option value="0">Original resolution (4K stays 4K)</option>
+        <select id="exportRes" title="Export quality — smaller sizes are smoother on slower computers" disabled>
+          <option value="orig">Load a video to see quality options</option>
         </select>
         <div class="progress-wrap" id="progWrap"><div class="progress-bar" id="progBar"></div></div>
         <span class="hint" id="burnStatus"></span>
       </div>
-      <div class="hint">Export keeps your source resolution (4K in → 4K out) with bitrate scaled up accordingly, and saves as MP4 where your browser supports it (Chrome, Edge, Safari), falling back to WebM otherwise. It renders in real time — a 4K clip on a slower device may take a little longer than its own runtime to export. If "Live-translate" is on, it'll keep translating just ahead of the export too — for a smooth burn, run "Translate all" first on anything you plan to export, so nothing's left waiting on a network call mid-render.</div>
+      <div class="hint">Pick the export quality in the dropdown — it lists your video's original size plus any smaller sizes you can scale down to (never larger, so a 1080p video can't be upscaled). Bitrate scales with the size you choose, and it saves as MP4 where your browser supports it (Chrome, Edge, Safari), falling back to WebM otherwise. It renders in real time — a 4K clip on a slower device may take a little longer than its own runtime to export. If "Live-translate" is on, it'll keep translating just ahead of the export too — for a smooth burn, run "Translate all" first on anything you plan to export, so nothing's left waiting on a network call mid-render.</div>
     </div>
 
     <div class="cue-col">
@@ -447,6 +445,50 @@
   }
 
   /* ---------------- video loading ---------------- */
+  /*TIERS_START*/
+  const EXPORT_TIERS = [
+    {label:'4K', long:3840},
+    {label:'2K (1440p)', long:2560},
+    {label:'1080p', long:1920},
+    {label:'720p', long:1280}
+  ];
+  function tierName(srcLong){
+    if(srcLong >= 3600) return '4K';
+    if(srcLong >= 2400) return '2K, 1440p';
+    if(srcLong >= 1800) return '1080p';
+    if(srcLong >= 1200) return '720p';
+    return null;
+  }
+  function populateExportOptions(){
+    const sel = $('exportRes');
+    const sw = video.videoWidth, sh = video.videoHeight;
+    sel.innerHTML = '';
+    const addOpt = (value, text)=>{
+      const o = document.createElement('option');
+      o.value = value; o.textContent = text;
+      sel.appendChild(o);
+    };
+    if(!sw || !sh){
+      addOpt('orig', 'Load a video to see quality options');
+      sel.disabled = true;
+      return;
+    }
+    // Tiers go by the longer side so vertical (portrait) and cropped widescreen videos classify correctly.
+    const srcLong = Math.max(sw, sh);
+    const even = n => Math.round(n/2)*2;
+    const name = tierName(srcLong);
+    addOpt('orig', `Original — ${sw}×${sh}` + (name ? ` (${name})` : ''));
+    EXPORT_TIERS.forEach(t=>{
+      if(t.long < srcLong*0.95){ // only smaller sizes — never upscale
+        const sc = t.long/srcLong;
+        addOpt(String(t.long), `${t.label} — ${even(sw*sc)}×${even(sh*sc)}`);
+      }
+    });
+    sel.disabled = false;
+    // Default: 1080p for bigger sources (smoother on most computers), otherwise the original.
+    sel.value = (srcLong*0.95 > 1920) ? '1920' : 'orig';
+  }
+  /*TIERS_END*/
   let exporting = false;
   let currentVideoObjectUrl = null;
   function setVideoObjectUrl(url){
@@ -464,8 +506,9 @@
       video.style.display = 'none';
       dropzone.style.display = 'flex';
       $('videoActions').style.display = 'none';
+      populateExportOptions();
     };
-    video.onloadedmetadata = ()=>{ videoDuration = video.duration || 0; setStep(2); toast('Video loaded'); $('videoActions').style.display = 'flex'; };
+    video.onloadedmetadata = ()=>{ videoDuration = video.duration || 0; setStep(2); toast('Video loaded'); $('videoActions').style.display = 'flex'; populateExportOptions(); };
     video.src = src;
     video.load();
   }
@@ -484,6 +527,7 @@
     $('videoActions').style.display = 'none';
     overlay.innerHTML = '';
     videoDuration = 0;
+    populateExportOptions();
     setStep(1);
     toast('Video removed — choose a new one');
   }
@@ -929,9 +973,17 @@
     try{
       ensureAudioGraph();
       exporting = true;
-      let W = video.videoWidth || 1280, H = video.videoHeight || 720;
-      const cap = parseInt($('exportRes').value, 10) || 0; // 0 = keep original
-      if(cap && H > cap){ const sc = cap / H; W = Math.round(W*sc/2)*2; H = cap; }
+      const srcW = video.videoWidth || 1280, srcH = video.videoHeight || 720;
+      let W = srcW, H = srcH;
+      const choice = $('exportRes').value;
+      if(choice !== 'orig'){
+        const targetLong = parseInt(choice, 10);
+        const srcLong = Math.max(srcW, srcH);
+        if(targetLong && targetLong < srcLong){
+          const sc = targetLong / srcLong;
+          W = Math.round(srcW*sc/2)*2; H = Math.round(srcH*sc/2)*2;
+        }
+      }
       const canvas = document.createElement('canvas');
       canvas.width = W; canvas.height = H;
       const ctx = canvas.getContext('2d');
@@ -992,7 +1044,7 @@
       const blob = new Blob(chunks, {type: outMime});
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'captioned_video.' + ext;
+      a.download = 'captioned_video_' + W + 'x' + H + '.' + ext;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(()=>URL.revokeObjectURL(a.href), 4000);
 
