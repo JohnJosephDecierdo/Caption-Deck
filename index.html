@@ -201,6 +201,9 @@
         <div class="cap-overlay pos-bottom" id="overlay"></div>
       </div>
       <input type="file" id="videoInput" accept="video/*" style="position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;">
+      <div class="field-row" id="videoActions" style="display:none;">
+        <button class="small ghost" id="changeVideoBtn">🔄 Change / remove video</button>
+      </div>
 
       <div class="url-row">
         <input type="text" id="videoUrl" placeholder="…or paste a direct video URL (must allow cross-origin playback)">
@@ -236,6 +239,11 @@
 
       <div class="export-row">
         <button class="burn" id="burnBtn">Burn captions &amp; download video</button>
+        <select id="exportRes" title="Export resolution — lower is smoother on slower computers">
+          <option value="1080" selected>Max 1080p (smoother)</option>
+          <option value="720">Max 720p (smoothest)</option>
+          <option value="0">Original resolution (4K stays 4K)</option>
+        </select>
         <div class="progress-wrap" id="progWrap"><div class="progress-bar" id="progBar"></div></div>
         <span class="hint" id="burnStatus"></span>
       </div>
@@ -439,6 +447,12 @@
   }
 
   /* ---------------- video loading ---------------- */
+  let exporting = false;
+  let currentVideoObjectUrl = null;
+  function setVideoObjectUrl(url){
+    if(currentVideoObjectUrl){ try{ URL.revokeObjectURL(currentVideoObjectUrl); }catch(e){} }
+    currentVideoObjectUrl = url;
+  }
   function showVideo(src, crossOrigin){
     if(crossOrigin) video.crossOrigin = 'anonymous'; else video.removeAttribute('crossorigin');
     video.style.display = 'block';
@@ -449,11 +463,31 @@
       toast('Could not load video: ' + (msgs[err && err.code] || 'unknown error'), true);
       video.style.display = 'none';
       dropzone.style.display = 'flex';
+      $('videoActions').style.display = 'none';
     };
-    video.onloadedmetadata = ()=>{ videoDuration = video.duration || 0; setStep(2); toast('Video loaded'); };
+    video.onloadedmetadata = ()=>{ videoDuration = video.duration || 0; setStep(2); toast('Video loaded'); $('videoActions').style.display = 'flex'; };
     video.src = src;
     video.load();
   }
+  function resetVideo(){
+    if(exporting || $('transcribeBtn').disabled){ toast('Wait for the current export/transcription to finish first', true); return; }
+    const msg = cues.length
+      ? 'Remove this video? Your captions stay, but their timing may not match the next video (you can re-sync with the shift buttons).'
+      : 'Remove this video and pick a different one?';
+    if(!confirm(msg)) return;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    setVideoObjectUrl(null);
+    video.style.display = 'none';
+    dropzone.style.display = 'flex';
+    $('videoActions').style.display = 'none';
+    overlay.innerHTML = '';
+    videoDuration = 0;
+    setStep(1);
+    toast('Video removed — choose a new one');
+  }
+  $('changeVideoBtn').addEventListener('click', resetVideo);
   dropzone.addEventListener('click', ()=> $('videoInput').click());
   ['dragover'].forEach(ev=> dropzone.addEventListener(ev, e=>{e.preventDefault(); dropzone.classList.add('drag');}));
   ['dragleave','drop'].forEach(ev=> dropzone.addEventListener(ev, e=>{e.preventDefault(); dropzone.classList.remove('drag');}));
@@ -462,14 +496,14 @@
     if(!f){ return; }
     const looksLikeVideo = f.type.startsWith('video/') || /\.(mp4|mov|webm|mkv|avi|m4v)$/i.test(f.name);
     if(!looksLikeVideo){ toast(`"${f.name}" doesn't look like a video file`, true); return; }
-    try{ showVideo(URL.createObjectURL(f), false); }
+    try{ const u = URL.createObjectURL(f); setVideoObjectUrl(u); showVideo(u, false); }
     catch(err){ toast('Could not read that file: ' + err.message, true); }
   });
   $('videoInput').addEventListener('change', e=>{
     const f = e.target.files[0];
     if(!f) return;
     toast('Loading ' + f.name + '…');
-    try{ showVideo(URL.createObjectURL(f), false); }
+    try{ const u = URL.createObjectURL(f); setVideoObjectUrl(u); showVideo(u, false); }
     catch(err){ toast('Could not read that file: ' + err.message, true); }
     e.target.value = ''; // allow re-selecting the same file later
   });
@@ -480,6 +514,7 @@
       toast("That platform won't allow direct browser playback — download the file first.", true);
       return;
     }
+    setVideoObjectUrl(null);
     showVideo(url, true);
   });
 
@@ -578,6 +613,7 @@
   }
 
   video.addEventListener('timeupdate', ()=>{
+    if(exporting){ maybeLiveTranslate(); return; } // keep the main thread free for drawing frames
     renderOverlayAt(video.currentTime);
     maybeLiveTranslate();
     const page = pageAt(video.currentTime);
@@ -838,6 +874,9 @@
     return 3_000_000;
   }
 
+  let _fontFam = null;
+  function getCanvasFontFamily(){ return _fontFam || (_fontFam = getComputedStyle(document.body).fontFamily); }
+  const measureCache = new Map();
   function drawCaptionOnCanvas(ctx, W, H, page, t){
     if(!page) return;
     const ai = activeWordIndex(page, t);
@@ -845,15 +884,22 @@
     const gap = baseFontSize*0.28;
     ctx.textBaseline = 'alphabetic';
     ctx.lineJoin = 'round';
-    const fontFamily = getComputedStyle(document.body).fontFamily;
+    const fontFamily = getCanvasFontFamily();
     const words = page.words.map(w => style.uppercase ? w.text.toUpperCase() : w.text);
     const sizes = words.map((w,i)=> i===ai ? baseFontSize*1.16 : baseFontSize);
     // Measure each word at the size it will actually render at (the active word is bigger),
     // so spacing/positioning is based on real widths — this is what caused words to crash
     // into each other before: widths were measured at one size but drawn at another.
     const widths = words.map((w,i)=>{
-      ctx.font = `800 ${sizes[i]}px ${fontFamily}`;
-      return ctx.measureText(w).width;
+      const key = sizes[i] + '|' + w;
+      let m = measureCache.get(key);
+      if(m === undefined){
+        ctx.font = `800 ${sizes[i]}px ${fontFamily}`;
+        m = ctx.measureText(w).width;
+        if(measureCache.size > 3000) measureCache.clear();
+        measureCache.set(key, m);
+      }
+      return m;
     });
     const totalW = widths.reduce((a,b)=>a+b,0) + gap*(words.length-1);
     let x = (W-totalW)/2;
@@ -882,7 +928,10 @@
 
     try{
       ensureAudioGraph();
-      const W = video.videoWidth || 1280, H = video.videoHeight || 720;
+      exporting = true;
+      let W = video.videoWidth || 1280, H = video.videoHeight || 720;
+      const cap = parseInt($('exportRes').value, 10) || 0; // 0 = keep original
+      if(cap && H > cap){ const sc = cap / H; W = Math.round(W*sc/2)*2; H = cap; }
       const canvas = document.createElement('canvas');
       canvas.width = W; canvas.height = H;
       const ctx = canvas.getContext('2d');
@@ -893,7 +942,9 @@
 
       const mime = pickMime();
       const recorder = new MediaRecorder(combined, mime ? {mimeType:mime, videoBitsPerSecond:pickBitrate(W,H)} : undefined);
-      statusEl.textContent = `Exporting at ${W}×${H}…`;
+      statusEl.textContent = `Exporting at ${W}×${H} — keep this tab open and in front…`;
+      const onVis = ()=>{ if(document.hidden && exporting) toast('Keep this tab visible while exporting, or the video will freeze', true); };
+      document.addEventListener('visibilitychange', onVis);
       const chunks = [];
       recorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
 
@@ -904,23 +955,34 @@
 
       video.currentTime = 0;
       await new Promise(r=>{ video.onseeked = r; });
+      const ended = new Promise(r=>{ video.onended = r; });
       recorder.start(250);
       await video.play();
 
-      let raf;
-      function frame(){
+      // Draw once per real video frame (instead of once per screen refresh), and only
+      // touch the page's text/progress bar a few times a second — less work per frame
+      // means fewer dropped frames, which is what shows up as freezing in the file.
+      let raf = 0, stopLoop = false, lastUi = 0;
+      const useRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+      function loop(){
+        if(stopLoop) return;
+        const t = video.currentTime;
         ctx.drawImage(video, 0, 0, W, H);
-        drawCaptionOnCanvas(ctx, W, H, pageAt(video.currentTime), video.currentTime);
-        progBar.style.width = Math.min(100, (video.currentTime/(video.duration||1))*100) + '%';
-        statusEl.textContent = `Rendering… ${fmtClock(video.currentTime)} / ${fmtClock(video.duration||0)}`;
-        if(!video.ended && !video.paused){ raf = requestAnimationFrame(frame); }
+        drawCaptionOnCanvas(ctx, W, H, pageAt(t), t);
+        const now = performance.now();
+        if(now - lastUi > 250){
+          lastUi = now;
+          progBar.style.width = Math.min(100, (t/(video.duration||1))*100) + '%';
+          statusEl.textContent = `Rendering… ${fmtClock(t)} / ${fmtClock(video.duration||0)} — keep this tab in front`;
+        }
+        if(useRVFC) video.requestVideoFrameCallback(loop); else raf = requestAnimationFrame(loop);
       }
-      raf = requestAnimationFrame(frame);
+      loop();
 
-      await new Promise(resolve=>{
-        video.onended = resolve;
-      });
-      cancelAnimationFrame(raf);
+      await ended;
+      stopLoop = true;
+      if(raf) cancelAnimationFrame(raf);
+      document.removeEventListener('visibilitychange', onVis);
       recorder.stop();
       await finished;
 
@@ -942,6 +1004,7 @@
       statusEl.textContent = '';
       toast('Export failed — this usually means the video source blocks canvas capture (try an uploaded file instead of a URL)', true);
     }finally{
+      exporting = false;
       btn.disabled = false;
       setTimeout(()=>{ progWrap.classList.remove('show'); progBar.style.width='0%'; }, 1500);
     }
