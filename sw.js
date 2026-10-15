@@ -1,9 +1,9 @@
 // Caption Deck service worker — caches the app shell so it loads offline after the first visit.
 //
-// IMPORTANT: bump CACHE_NAME (e.g. 'caption-deck-v8') any time you update index.html and
+// IMPORTANT: bump CACHE_NAME (e.g. 'caption-deck-v9') any time you update index.html and
 // re-upload it to GitHub. Otherwise visitors' browsers may keep serving the old cached
 // version instead of picking up your changes.
-const CACHE_NAME = 'caption-deck-v8';
+const CACHE_NAME = 'caption-deck-v9';
 const SHELL_FILES = [
   './',
   './index.html',

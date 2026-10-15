@@ -73,21 +73,23 @@
   .dropzone .small{font-size:12px;}
 
   .cap-overlay{
-    position:absolute;left:4%;right:4%;pointer-events:none;
-    display:flex;flex-wrap:wrap;justify-content:center;gap:0.35em;
-    font-weight:800;line-height:1.3;text-align:center;
+    position:absolute;left:5%;right:5%;pointer-events:none;
+    display:flex;flex-direction:column;align-items:center;
+    font-weight:800;line-height:1.22;text-align:center;
   }
   .cap-overlay.pos-bottom{bottom:6%;}
   .cap-overlay.pos-middle{top:50%;transform:translateY(-50%);}
   .cap-overlay.pos-top{top:8%;}
+  .cap-line{display:flex;justify-content:center;gap:0 0.34em;white-space:nowrap;}
   .cap-word{
     color:#fff;-webkit-text-stroke:0.055em #000;paint-order:stroke fill;
     text-shadow:0 2px 6px rgba(0,0,0,.55);
     transition:color .08s, transform .08s;
-    display:inline-block;
+    display:inline-block;transform-origin:50% 80%;
   }
-  .cap-word.uc{text-transform:uppercase;}
-  .cap-word.active{font-size:1.16em;}
+  /* Highlight "pop" is a small visual scale (no layout change) so lines never reflow or jump
+     while the highlight moves; the gap between words is wide enough to absorb it. */
+  .cap-word.active{transform:scale(1.08);}
 
   .style-panel{
     display:flex;flex-wrap:wrap;gap:10px;align-items:center;
@@ -220,8 +222,11 @@
         <div class="grp"><label>Position</label>
           <select id="capPosition"><option value="bottom" selected>Bottom</option><option value="middle">Middle</option><option value="top">Top</option></select>
         </div>
-        <div class="grp"><label>Words shown at once</label>
-          <select id="capWords"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select>
+        <div class="grp"><label>Words on screen</label>
+          <select id="capWords" title="Auto groups words by how fast they are spoken, so every line stays up long enough to read"><option value="auto" selected>Auto (follows speaking pace)</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option></select>
+        </div>
+        <div class="grp"><label>Reading pace</label>
+          <select id="capPace" title="Used by Auto: how fast viewers are expected to read"><option value="13">Relaxed</option><option value="17" selected>Standard</option><option value="21">Quick</option></select>
         </div>
         <div class="grp"><label>Highlight color</label>
           <div class="swatches" id="swatches">
@@ -347,7 +352,7 @@
   let cues = []; // {start, end, text, trans}
   let videoDuration = 0;
   let pages = []; // precomputed karaoke pages
-  const style = { source:'text', position:'bottom', wordsPerGroup:3, highlight:'#f2b705', uppercase:true };
+  const style = { source:'text', position:'bottom', wordsPerGroup:'auto', readCps:17, highlight:'#f2b705', uppercase:true };
 
   const LANGS = [
     ["es","Spanish"],["tl","Filipino (Tagalog)"],["ja","Japanese"],
@@ -508,7 +513,7 @@
       $('videoActions').style.display = 'none';
       populateExportOptions();
     };
-    video.onloadedmetadata = ()=>{ videoDuration = video.duration || 0; setStep(2); toast('Video loaded'); $('videoActions').style.display = 'flex'; populateExportOptions(); };
+    video.onloadedmetadata = ()=>{ videoDuration = video.duration || 0; setStep(2); toast('Video loaded'); $('videoActions').style.display = 'flex'; populateExportOptions(); layoutOverlay(); rebuildPages(); };
     video.src = src;
     video.load();
   }
@@ -528,6 +533,7 @@
     overlay.innerHTML = '';
     videoDuration = 0;
     populateExportOptions();
+    layoutOverlay();
     setStep(1);
     toast('Video removed — choose a new one');
   }
@@ -564,8 +570,13 @@
 
   /* ---------------- caption style controls ---------------- */
   $('capSource').addEventListener('change', e=>{ style.source = e.target.value; rebuildPages(); scheduleSave(); });
-  $('capPosition').addEventListener('change', e=>{ style.position = e.target.value; overlay.className = 'cap-overlay pos-'+style.position; scheduleSave(); });
-  $('capWords').addEventListener('change', e=>{ style.wordsPerGroup = parseInt(e.target.value); rebuildPages(); scheduleSave(); });
+  $('capPosition').addEventListener('change', e=>{ style.position = e.target.value; overlay.className = 'cap-overlay pos-'+style.position; layoutOverlay(); tickOverlay(); scheduleSave(); });
+  $('capWords').addEventListener('change', e=>{
+    style.wordsPerGroup = e.target.value === 'auto' ? 'auto' : parseInt(e.target.value, 10);
+    $('capPace').disabled = style.wordsPerGroup !== 'auto';
+    rebuildPages(); scheduleSave();
+  });
+  $('capPace').addEventListener('change', e=>{ style.readCps = parseInt(e.target.value, 10); rebuildPages(); scheduleSave(); });
   $('capUpper').addEventListener('change', e=>{ style.uppercase = e.target.checked; scheduleSave(); });
   document.querySelectorAll('#swatches .swatch').forEach(sw=>{
     sw.addEventListener('click', ()=>{
@@ -579,10 +590,10 @@
   /* ---------------- word-level karaoke timeline ---------------- */
   function buildWordTimeline(){
     const words = [];
-    cues.forEach(c=>{
-      // Use real Whisper word-level timestamps when available and we're showing the original text unedited.
+    cues.forEach((c, ci)=>{
+      // Real Whisper word timestamps when available and we're showing the original text unedited.
       if(style.source === 'text' && c.words && c.words.length){
-        c.words.forEach(w => words.push({text:w.text, start:w.start, end:w.end}));
+        c.words.forEach(w => words.push({text:w.text, start:w.start, end:w.end, cue:ci}));
         return;
       }
       const src = (style.source==='trans' ? c.trans : c.text) || '';
@@ -594,41 +605,192 @@
       let t = c.start;
       list.forEach((w,i)=>{
         const wdur = dur * weights[i]/totalW;
-        words.push({text:w, start:t, end:t+wdur});
+        words.push({text:w, start:t, end:t+wdur, cue:ci});
         t += wdur;
       });
     });
+    // Tidy timing glitches (zero-length or out-of-order words) so highlighting never jumps backwards.
+    let prev = null;
+    words.forEach(w=>{
+      if(prev && w.start < prev.start) w.start = prev.start;
+      if(!(w.end > w.start)) w.end = w.start + 0.08;
+      prev = w;
+    });
     return words;
   }
+
+  /* ---- Auto grouping: how many words go on screen at once ----
+     Fast speech gets MORE words per line (so each line stays up long enough to read),
+     slow speech gets fewer. A line stays up until the next one replaces it, and is held a
+     little after the speaker stops so the last words can still be read. */
+  const PACE = { minDur:1.0, maxHold:1.2, hardGap:0.7, softGap:0.3, maxWords:12 };
+  const endsSentence = (t)=> /[.!?…。！？]["')\]]?$/.test(t);
+  const endsPunct = (t)=> /[.!?…,;:。！？、]["')\]]?$/.test(t);
+  const wordsLen = (arr)=> arr.reduce((n,w)=> n + w.text.length, 0) + Math.max(0, arr.length-1);
+
+  function buildAutoPages(words){
+    const cps = style.readCps || 17; // comfortable reading speed, characters per second
+    const maxChars = (video.videoHeight > video.videoWidth) ? 36 : 56; // about two lines on screen (fewer for vertical video)
+    const chunks = [];
+    let i = 0;
+    while(i < words.length){
+      const chunk = [words[i]];
+      let j = i + 1;
+      while(j < words.length){
+        const first = chunk[0], last = chunk[chunk.length-1], next = words[j];
+        const gap = next.start - last.end;
+        if(gap >= PACE.hardGap) break;                                   // natural pause: start a new line
+        const chars = wordsLen(chunk);
+        if(chunk.length >= PACE.maxWords || chars + 1 + next.text.length > maxChars) break; // screen is full
+        // If we stopped here, would this line be up long enough to read?
+        const visibleEnd = Math.min(next.start, last.end + PACE.maxHold);
+        const needed = Math.max(PACE.minDur, chars / cps);
+        const ratio = (visibleEnd - first.start) / needed;
+        const comfortable = ratio >= 1;
+        // Comfortable already: stop at a natural spot (punctuation, a breath, a sentence/caption change, or 4+ words).
+        if(comfortable && (endsPunct(last.text) || gap >= PACE.softGap || chunk.length >= 4 || next.cue !== last.cue)) break;
+        // Nearly comfortable and the sentence just ended: finish there instead of dragging the next sentence in.
+        if(ratio >= 0.7 && endsSentence(last.text)) break;
+        chunk.push(next); j++;                                           // too quick to read: take more words
+      }
+      chunks.push(chunk);
+      i = j;
+    }
+    return chunks.map((chunk, k)=>{
+      const first = chunk[0], last = chunk[chunk.length-1];
+      const nextFirst = chunks[k+1] ? chunks[k+1][0] : null;
+      const needed = Math.max(PACE.minDur, wordsLen(chunk) / cps);
+      const cap = last.end + PACE.maxHold;
+      let end = Math.min(Math.max(last.end, first.start + needed), cap);
+      if(nextFirst){
+        if(nextFirst.start <= cap) end = nextFirst.start; // short pause: keep it up until the next line replaces it
+        else end = Math.min(end, nextFirst.start);
+      }
+      end = Math.max(end, first.start + 0.1);
+      return {start:first.start, end, words:chunk};
+    });
+  }
+
   function rebuildPages(){
     const words = buildWordTimeline();
-    pages = [];
-    const n = style.wordsPerGroup;
-    for(let i=0;i<words.length;i+=n){
-      const chunk = words.slice(i, i+n);
-      pages.push({start:chunk[0].start, end:chunk[chunk.length-1].end, words:chunk});
+    if(style.wordsPerGroup === 'auto'){
+      pages = buildAutoPages(words);
+    }else{
+      pages = [];
+      const n = Math.max(1, parseInt(style.wordsPerGroup, 10) || 3);
+      for(let i=0;i<words.length;i+=n){
+        const chunk = words.slice(i, i+n);
+        pages.push({start:chunk[0].start, end:chunk[chunk.length-1].end, words:chunk});
+      }
     }
+    pages.forEach((p,i)=>{ p.id = i; });
+    ovKey = '';
+    tickOverlay();
   }
   function pageAt(t){ return pages.find(p => t>=p.start && t<p.end); }
+  // The highlight stays on the most recently spoken word (no flicker in the tiny gaps between words).
   function activeWordIndex(page, t){
-    let idx = page.words.findIndex(w => t>=w.start && t<w.end);
-    if(idx===-1 && t>=page.end) idx = page.words.length-1;
+    let idx = -1;
+    for(let k=0;k<page.words.length;k++){ if(page.words[k].start <= t) idx = k; else break; }
     return idx;
   }
 
+  /* ---- Line layout, shared by the live preview and the exported video ---- */
+  let _fontFam = null;
+  function getCanvasFontFamily(){ return _fontFam || (_fontFam = getComputedStyle(document.body).fontFamily); }
+  const mctx = document.createElement('canvas').getContext('2d');
+  const POP = 1.08;
+  // Lines are worked out once per page at a fixed size (not depending on which word is lit),
+  // so text never reflows or jumps while the highlight moves. Two-line captions are balanced.
+  function layoutPageLines(ctx, W, H, page, base, fontFamily){
+    const key = W.toFixed(1) + 'x' + H.toFixed(1) + '|' + style.uppercase;
+    if(page._lay && page._lay.key === key) return page._lay;
+    const gap = base*0.34, maxW = W*0.9;
+    const words = page.words.map(w => style.uppercase ? w.text.toUpperCase() : w.text);
+    ctx.font = `800 ${base}px ${fontFamily}`;
+    const widths = words.map(w => ctx.measureText(w).width);
+    const span = (a,b)=>{ let sum = 0; for(let k=a;k<b;k++) sum += widths[k]; return sum + gap*(b-a-1); };
+    let breaks = [0], lineStart = 0;
+    for(let k=1;k<words.length;k++){
+      if(span(lineStart, k+1) > maxW){ breaks.push(k); lineStart = k; }
+    }
+    breaks.push(words.length);
+    if(breaks.length === 3){ // exactly two lines: balance them so the second isn't a lone word
+      let bestK = breaks[1], bestMax = Math.max(span(0,breaks[1]), span(breaks[1],words.length));
+      for(let k=1;k<words.length;k++){
+        const l1 = span(0,k), l2 = span(k,words.length);
+        if(l1 <= maxW && l2 <= maxW && Math.max(l1,l2) < bestMax){ bestMax = Math.max(l1,l2); bestK = k; }
+      }
+      breaks = [0, bestK, words.length];
+    }
+    const lines = [];
+    for(let b=0;b<breaks.length-1;b++){
+      const idx = [];
+      for(let k=breaks[b];k<breaks[b+1];k++) idx.push(k);
+      lines.push({idx, width: span(breaks[b], breaks[b+1])});
+    }
+    page._lay = {key, words, widths, lines, gap};
+    return page._lay;
+  }
+
+  /* ---- Live preview overlay ---- */
+  let ovBox = null, ovKey = '', ovRaf = 0;
+  function layoutOverlay(){
+    const stageEl = $('stage');
+    const sw = stageEl.clientWidth, sh = stageEl.clientHeight;
+    if(!sw || !sh) return;
+    const vw = video.videoWidth || 16, vh = video.videoHeight || 9;
+    const sc = Math.min(sw/vw, sh/vh), dw = vw*sc, dh = vh*sc; // where the video actually sits in the box
+    const base = Math.max(10, Math.min(dw,dh)*0.06);            // same proportion the export uses
+    ovBox = {dw, dh, base};
+    const offX = (sw-dw)/2, offY = (sh-dh)/2;
+    overlay.style.fontSize = base + 'px';
+    overlay.style.left = (offX + dw*0.05) + 'px';
+    overlay.style.right = (offX + dw*0.05) + 'px';
+    overlay.style.top = ''; overlay.style.bottom = '';
+    if(style.position === 'bottom') overlay.style.bottom = Math.max(0, offY + dh*0.14 - base*0.26) + 'px';
+    else if(style.position === 'top') overlay.style.top = Math.max(0, offY + dh*0.14 - base*0.95) + 'px';
+    ovKey = '';
+  }
   function renderOverlayAt(t){
     const page = pageAt(t);
     overlay.innerHTML = '';
     if(!page) return;
     const ai = activeWordIndex(page, t);
-    page.words.forEach((w,i)=>{
-      const span = document.createElement('span');
-      span.className = 'cap-word' + (style.uppercase?' uc':'') + (i===ai?' active':'');
-      if(i===ai) span.style.color = style.highlight;
-      span.textContent = w.text;
-      overlay.appendChild(span);
+    const box = ovBox || {dw:640, dh:360, base:21.6};
+    const lay = layoutPageLines(mctx, box.dw, box.dh, page, box.base, getCanvasFontFamily());
+    lay.lines.forEach(ln=>{
+      const row = document.createElement('div');
+      row.className = 'cap-line';
+      ln.idx.forEach(i=>{
+        const span = document.createElement('span');
+        span.className = 'cap-word' + (i===ai ? ' active' : '');
+        if(i===ai) span.style.color = style.highlight;
+        span.textContent = lay.words[i];
+        row.appendChild(span);
+      });
+      overlay.appendChild(row);
     });
   }
+  // Only touch the page when the visible line or the lit word actually changes.
+  function tickOverlay(){
+    if(exporting) return;
+    const t = video.currentTime;
+    const page = pageAt(t);
+    const ai = page ? activeWordIndex(page, t) : -2;
+    const key = (page ? page.id : -1) + ':' + ai + ':' + style.highlight + ':' + style.uppercase;
+    if(key === ovKey) return;
+    ovKey = key;
+    renderOverlayAt(t);
+  }
+  function overlayLoop(){
+    tickOverlay();
+    if(!exporting && !video.paused && !video.ended) ovRaf = requestAnimationFrame(overlayLoop);
+  }
+  ['play','playing','seeking','seeked','pause','ended'].forEach(ev=> video.addEventListener(ev, ()=>{
+    cancelAnimationFrame(ovRaf); overlayLoop();
+  }));
+  if('ResizeObserver' in window) new ResizeObserver(()=>{ layoutOverlay(); tickOverlay(); }).observe($('stage'));
 
   let liveTranslateOn = false;
   const liveInFlight = new Set();
@@ -658,7 +820,7 @@
 
   video.addEventListener('timeupdate', ()=>{
     if(exporting){ maybeLiveTranslate(); return; } // keep the main thread free for drawing frames
-    renderOverlayAt(video.currentTime);
+    tickOverlay();
     maybeLiveTranslate();
     const page = pageAt(video.currentTime);
     document.querySelectorAll('.cue').forEach(el=>el.classList.remove('active'));
@@ -703,10 +865,13 @@
       if(data.targetLang) langSel.value = data.targetLang;
       $('capSource').value = style.source;
       $('capPosition').value = style.position;
-      $('capWords').value = style.wordsPerGroup;
+      $('capWords').value = String(style.wordsPerGroup);
+      $('capPace').value = String(style.readCps || 17);
+      $('capPace').disabled = style.wordsPerGroup !== 'auto';
       $('capUpper').checked = style.uppercase;
       document.querySelectorAll('#swatches .swatch').forEach(s=> s.classList.toggle('sel', s.dataset.c === style.highlight));
       overlay.className = 'cap-overlay pos-' + style.position;
+      layoutOverlay();
       renderCues();
       banner.style.display = 'none';
       toast('Captions restored — load your video to continue');
@@ -918,45 +1083,35 @@
     return 3_000_000;
   }
 
-  let _fontFam = null;
-  function getCanvasFontFamily(){ return _fontFam || (_fontFam = getComputedStyle(document.body).fontFamily); }
-  const measureCache = new Map();
   function drawCaptionOnCanvas(ctx, W, H, page, t){
     if(!page) return;
     const ai = activeWordIndex(page, t);
-    const baseFontSize = Math.max(22, Math.min(64, W*0.05));
-    const gap = baseFontSize*0.28;
+    const base = Math.max(22, Math.min(W,H)*0.06); // proportional, so every export size looks the same
+    const fontFamily = getCanvasFontFamily();
+    const lay = layoutPageLines(ctx, W, H, page, base, fontFamily);
+    const lh = base*1.22, n = lay.lines.length;
+    let y0;
+    if(style.position === 'bottom') y0 = H*0.86 - (n-1)*lh;           // last line sits at the usual spot, extra lines stack upward
+    else if(style.position === 'top') y0 = H*0.14;
+    else y0 = H*0.5 + base*0.35 - (n-1)*lh/2;
     ctx.textBaseline = 'alphabetic';
     ctx.lineJoin = 'round';
-    const fontFamily = getCanvasFontFamily();
-    const words = page.words.map(w => style.uppercase ? w.text.toUpperCase() : w.text);
-    const sizes = words.map((w,i)=> i===ai ? baseFontSize*1.16 : baseFontSize);
-    // Measure each word at the size it will actually render at (the active word is bigger),
-    // so spacing/positioning is based on real widths — this is what caused words to crash
-    // into each other before: widths were measured at one size but drawn at another.
-    const widths = words.map((w,i)=>{
-      const key = sizes[i] + '|' + w;
-      let m = measureCache.get(key);
-      if(m === undefined){
-        ctx.font = `800 ${sizes[i]}px ${fontFamily}`;
-        m = ctx.measureText(w).width;
-        if(measureCache.size > 3000) measureCache.clear();
-        measureCache.set(key, m);
-      }
-      return m;
-    });
-    const totalW = widths.reduce((a,b)=>a+b,0) + gap*(words.length-1);
-    let x = (W-totalW)/2;
-    const y = style.position==='bottom' ? H*0.86 : style.position==='top' ? H*0.14 : H*0.5;
-    words.forEach((w,i)=>{
-      const active = i===ai;
-      ctx.font = `800 ${sizes[i]}px ${fontFamily}`;
-      ctx.lineWidth = sizes[i]*0.11;
-      ctx.strokeStyle = 'rgba(0,0,0,0.9)';
-      ctx.fillStyle = active ? style.highlight : '#ffffff';
-      ctx.strokeText(w, x, y);
-      ctx.fillText(w, x, y);
-      x += widths[i] + gap;
+    ctx.font = `800 ${base}px ${fontFamily}`;
+    ctx.lineWidth = base*0.11;
+    ctx.strokeStyle = 'rgba(0,0,0,0.9)';
+    lay.lines.forEach((ln, li)=>{
+      const y = y0 + li*lh;
+      let x = (W - ln.width)/2;
+      ln.idx.forEach(i=>{
+        const w = lay.widths[i], active = (i === ai);
+        ctx.save();
+        if(active){ const cx = x + w/2; ctx.translate(cx, y); ctx.scale(POP, POP); ctx.translate(-cx, -y); }
+        ctx.fillStyle = active ? style.highlight : '#ffffff';
+        ctx.strokeText(lay.words[i], x, y);
+        ctx.fillText(lay.words[i], x, y);
+        ctx.restore();
+        x += w + lay.gap;
+      });
     });
   }
 
