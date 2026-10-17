@@ -150,6 +150,7 @@
   .cue-empty{color:var(--text-dim);font-size:13px;text-align:center;padding:30px 10px;line-height:1.6;}
   .cue{border:1px solid var(--line);border-radius:8px;padding:9px 10px;background:var(--panel-2);}
   .cue.active{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber) inset;}
+  .cue.bad{border-color:var(--danger);}
   .cue-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:6px;}
   .cue-time{display:flex;gap:5px;align-items:center;font-family:var(--mono);font-size:11px;color:var(--text-dim);}
   .cue-time input{width:64px;padding:3px 5px;font-size:11px;text-align:center;}
@@ -308,6 +309,10 @@
             <option value="tiny">Tiny — fastest</option>
             <option value="base" selected>Base — balanced</option>
             <option value="small">Small — most accurate, slower</option>
+          </select>
+          <select id="asrTiming" title="How precisely each word is timed">
+            <option value="word" selected>Word timing (auto-fallback)</option>
+            <option value="segment">Phrase timing (most dependable)</option>
           </select>
         </div>
         <div class="hint" id="asrStatus">Runs fully in your browser using Whisper — no upload, no account. First run downloads the model (~40–250MB depending on size); it's cached after that. Works best in Chrome/Edge. Only works when you've opened this file directly, not the in-chat preview.</div>
@@ -592,7 +597,9 @@
     const words = [];
     cues.forEach((c, ci)=>{
       // Real Whisper word timestamps when available and we're showing the original text unedited.
-      if(style.source === 'text' && c.words && c.words.length){
+      const wordsUsable = c.words && c.words.length &&
+        ((c.words[c.words.length-1].end - c.words[0].start) >= (c.words.length < 3 ? 0.01 : c.words.length * 0.05));
+      if(style.source === 'text' && wordsUsable){
         c.words.forEach(w => words.push({text:w.text, start:w.start, end:w.end, cue:ci}));
         return;
       }
@@ -601,7 +608,13 @@
       if(!list.length) return;
       const weights = list.map(w=>w.length+1);
       const totalW = weights.reduce((a,b)=>a+b,0);
-      const dur = Math.max(0.05, c.end - c.start);
+      let dur = c.end - c.start;
+      if(dur < 0.3){
+        // A caption with (almost) no length would flash by unreadably: give it a readable duration.
+        dur = Math.min(6, Math.max(1.2, src.length / 15));
+        const nx = cues[ci+1];
+        if(nx && nx.start > c.start) dur = Math.min(dur, Math.max(0.3, nx.start - c.start));
+      }
       let t = c.start;
       list.forEach((w,i)=>{
         const wdur = dur * weights[i]/totalW;
@@ -889,7 +902,8 @@
     if(!cues.length){ cueList.appendChild(cueEmpty); rebuildPages(); return; }
     cues.forEach((c, i)=>{
       const row = document.createElement('div');
-      row.className = 'cue'; row.dataset.idx = i;
+      row.className = 'cue' + ((c.end - c.start) < 0.3 ? ' bad' : ''); row.dataset.idx = i;
+      if((c.end - c.start) < 0.3) row.title = 'This caption has almost no duration, so it flashes by. Set its start/end times, or re-transcribe.';
       row.innerHTML = `
         <div class="cue-top">
           <span class="cue-num">${i+1}</span>
@@ -952,7 +966,7 @@
     cues = /\.vtt$/i.test(f.name) ? parseVTT(text) : parseSRT(text);
     renderCues();
     setStep(cues.length? 3 : 2);
-    toast(`Imported ${cues.length} cues`);
+    toast(collapsedShare(cues) > 0.3 ? `Imported ${cues.length} cues, but many have almost no duration, so check their timing` : `Imported ${cues.length} cues`, collapsedShare(cues) > 0.3);
   });
 
   const pasteModal = $('pasteModal');
@@ -1277,14 +1291,14 @@
     }
     return asrWorker;
   }
-  function runWhisperInWorker(pcm, modelSize, onEvent){
+  function runWhisperInWorker(pcm, modelSize, timing, onEvent){
     return new Promise((resolve, reject)=>{
       const worker = getAsrWorker();
       function handler(e){
         const msg = e.data;
         if(msg.type === 'done'){
           worker.removeEventListener('message', handler);
-          resolve(msg.result);
+          resolve({result: msg.result, mode: msg.mode, timingOk: msg.timingOk});
         }else if(msg.type === 'error'){
           worker.removeEventListener('message', handler);
           reject(new Error(msg.message));
@@ -1294,8 +1308,30 @@
       }
       worker.addEventListener('message', handler);
       // Transfer the buffer instead of copying it — cheap even for long audio.
-      worker.postMessage({type:'transcribe', modelSize, pcm}, [pcm.buffer]);
+      worker.postMessage({type:'transcribe', modelSize, pcm, timing}, [pcm.buffer]);
     });
+  }
+  function segmentsToCues(chunks, totalDur){
+    const out = [];
+    chunks.forEach((c, i)=>{
+      const text = (c.text || '').trim();
+      if(!text) return;
+      const ts = c.timestamp || [];
+      const start = ts[0] != null ? ts[0] : (out.length ? out[out.length-1].end : 0);
+      let end = ts[1];
+      if(end == null){
+        const nx = chunks[i+1] && chunks[i+1].timestamp ? chunks[i+1].timestamp[0] : null;
+        end = nx != null ? nx : (totalDur ? Math.min(totalDur, start + 4) : start + 4);
+      }
+      if(end <= start) end = start + 0.5;
+      out.push({start, end, text, trans:''});
+    });
+    return out;
+  }
+  // Share of captions that are (almost) zero-length — a sign the source timing is broken.
+  function collapsedShare(list){
+    if(!list.length) return 0;
+    return list.filter(c => (c.end - c.start) < 0.3).length / list.length;
   }
   function groupWordsIntoCues(wordChunks){
     const PAUSE_BREAK = 0.6, MAX_WORDS = 14;
@@ -1353,34 +1389,44 @@
       statusEl.textContent = 'Loading Whisper (first run downloads it, then it is cached in your browser)…';
       const startedAt = Date.now();
       const fmtElapsed = (ms)=>{ const s=Math.round(ms/1000); return Math.floor(s/60)+'m '+(s%60)+'s'; };
+      let phase = 'Loading Whisper…';
       elapsedTimer = setInterval(()=>{
-        statusEl.textContent = `Working… ${fmtElapsed(Date.now()-startedAt)} elapsed (no fixed end time — depends on your device). The page stays responsive now — this runs in the background.`;
+        statusEl.textContent = `${phase} ${fmtElapsed(Date.now()-startedAt)} elapsed (no fixed end time, depends on your device). The page stays responsive — this runs in the background.`;
       }, 1000);
 
       // Runs in a Web Worker (a background thread) so the page — video preview, buttons,
       // this status text — stays fully responsive instead of freezing during transcription.
-      const result = await runWhisperInWorker(pcm, modelSize, (msg)=>{
+      const timing = $('asrTiming').value;
+      const out = await runWhisperInWorker(pcm, modelSize, timing, (msg)=>{
         if(msg.type === 'progress'){
-          statusEl.textContent = `Downloading model (${msg.file || 'weights'})… ${Math.round(msg.progress||0)}%`;
+          phase = `Downloading model (${msg.file || 'weights'}) ${Math.round(msg.progress||0)}%…`;
         }else if(msg.type === 'status'){
-          statusEl.textContent = msg.text;
+          phase = msg.text;
         }
       });
 
       clearInterval(elapsedTimer); elapsedTimer=null;
 
-      const wordChunks = (result.chunks && result.chunks.length) ? result.chunks : null;
-      if(wordChunks){
-        cues = groupWordsIntoCues(wordChunks);
+      const result = out.result;
+      const chunks = (result.chunks && result.chunks.length) ? result.chunks : null;
+      if(chunks && out.mode === 'word'){
+        cues = groupWordsIntoCues(chunks);
+      }else if(chunks){
+        cues = segmentsToCues(chunks, videoDuration);
       }else{
-        // fallback for older/unsupported word-timestamp responses
         cues = [{start:0, end: videoDuration||10, text:(result.text||'').trim(), trans:''}].filter(c=>c.text);
       }
 
       renderCues();
       setStep(3);
-      statusEl.textContent = `Transcribed ${cues.length} segments with Whisper (${modelSize}) in ${fmtElapsed(Date.now()-startedAt)}.`;
-      toast('Transcription complete');
+      const usedFallback = (timing === 'word' && out.mode === 'segment');
+      statusEl.textContent = `Transcribed ${cues.length} captions with Whisper (${modelSize}) in ${fmtElapsed(Date.now()-startedAt)}` +
+        (usedFallback ? ' — word timing was unreliable on this clip, so phrase timing was used.' : '.');
+      if(!out.timingOk || collapsedShare(cues) > 0.3){
+        toast('The timing still looks wrong on this clip. Try the Small model, or transcribe with Subtitle Edit and import the .srt.', true);
+      }else{
+        toast(usedFallback ? 'Transcription complete (phrase timing)' : 'Transcription complete');
+      }
     }catch(err){
       console.error(err);
       if(elapsedTimer) clearInterval(elapsedTimer);
