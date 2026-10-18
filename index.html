@@ -243,6 +243,16 @@
         </div>
       </div>
 
+      <div class="style-panel" id="rangePanel">
+        <div class="grp"><label>Export from</label><input type="text" id="rangeStart" value="0:00.0" style="width:76px;"></div>
+        <button class="small ghost" id="rangeStartNow" title="Use the video's current time">Use current time</button>
+        <div class="grp"><label>to</label><input type="text" id="rangeEnd" value="0:00.0" style="width:76px;"></div>
+        <button class="small ghost" id="rangeEndNow" title="Use the video's current time">Use current time</button>
+        <button class="small ghost" id="rangeFull">Whole video</button>
+        <button class="small" id="rangePreview">▶ Preview selection</button>
+        <span class="hint" id="rangeInfo" style="flex-basis:100%;">Load a video first.</span>
+      </div>
+
       <div class="export-row">
         <button class="burn" id="burnBtn">Burn captions &amp; download video</button>
         <select id="exportRes" title="Export quality — smaller sizes are smoother on slower computers" disabled>
@@ -518,7 +528,7 @@
       $('videoActions').style.display = 'none';
       populateExportOptions();
     };
-    video.onloadedmetadata = ()=>{ videoDuration = video.duration || 0; setStep(2); toast('Video loaded'); $('videoActions').style.display = 'flex'; populateExportOptions(); layoutOverlay(); rebuildPages(); };
+    video.onloadedmetadata = ()=>{ videoDuration = video.duration || 0; setStep(2); toast('Video loaded'); $('videoActions').style.display = 'flex'; populateExportOptions(); layoutOverlay(); rebuildPages(); rangeStart = 0; rangeEnd = 0; updateRangeUI(); };
     video.src = src;
     video.load();
   }
@@ -539,6 +549,7 @@
     videoDuration = 0;
     populateExportOptions();
     layoutOverlay();
+    rangeStart = 0; rangeEnd = 0; updateRangeUI();
     setStep(1);
     toast('Video removed — choose a new one');
   }
@@ -798,6 +809,7 @@
   }
   function overlayLoop(){
     tickOverlay();
+    if(rangePreviewing && video.currentTime >= currentRange().re) video.pause(); // end of the previewed selection
     if(!exporting && !video.paused && !video.ended) ovRaf = requestAnimationFrame(overlayLoop);
   }
   ['play','playing','seeking','seeked','pause','ended'].forEach(ev=> video.addEventListener(ev, ()=>{
@@ -1129,15 +1141,58 @@
     });
   }
 
+  /* ---------------- export range (trim) ---------------- */
+  // rangeEnd = 0 means "to the end of the video", so it adapts when you load a different video.
+  let rangeStart = 0, rangeEnd = 0, rangePreviewing = false;
+  function currentRange(){
+    const dur = video.duration || 0;
+    const rs = Math.max(0, Math.min(rangeStart, dur));
+    const re = rangeEnd > 0 ? Math.min(rangeEnd, dur) : dur;
+    return {rs, re, full: rs <= 0.05 && re >= dur - 0.05};
+  }
+  function updateRangeUI(){
+    const r = currentRange(), len = r.re - r.rs;
+    $('rangeStart').value = fmtClock(r.rs);
+    $('rangeEnd').value = fmtClock(r.re);
+    $('rangeInfo').textContent = !video.duration ? 'Load a video first.'
+      : len < 0.5 ? 'That selection is too short (it needs at least half a second).'
+      : r.full ? `Whole video (${fmtClock(len)}).`
+      : `Only ${fmtClock(len)} will be exported (${fmtClock(r.rs)} to ${fmtClock(r.re)}). Captions keep their original timing.`;
+  }
+  $('rangeStart').addEventListener('change', e=>{
+    rangeStart = Math.max(0, parseClock(e.target.value));
+    if(rangeEnd > 0 && rangeStart >= rangeEnd - 0.5) rangeEnd = 0;
+    updateRangeUI();
+  });
+  $('rangeEnd').addEventListener('change', e=>{ rangeEnd = Math.max(0, parseClock(e.target.value)); updateRangeUI(); });
+  $('rangeStartNow').addEventListener('click', ()=>{
+    rangeStart = video.currentTime || 0;
+    if(rangeEnd > 0 && rangeStart >= rangeEnd - 0.5) rangeEnd = 0;
+    updateRangeUI();
+  });
+  $('rangeEndNow').addEventListener('click', ()=>{ rangeEnd = video.currentTime || 0; updateRangeUI(); });
+  $('rangeFull').addEventListener('click', ()=>{ rangeStart = 0; rangeEnd = 0; updateRangeUI(); });
+  $('rangePreview').addEventListener('click', async ()=>{
+    if(!video.duration){ toast('Load a video first', true); return; }
+    const r = currentRange();
+    if(r.re - r.rs < 0.5){ toast('That selection is too short', true); return; }
+    video.currentTime = r.rs;
+    try{ await video.play(); rangePreviewing = true; }catch(e){}
+  });
+  video.addEventListener('pause', ()=>{ rangePreviewing = false; });
+
   $('burnBtn').addEventListener('click', burnAndDownload);
   async function burnAndDownload(){
     if(!video.src){ toast('Load a video first', true); return; }
     if(!cues.length){ toast('Add captions first', true); return; }
     if(!window.MediaRecorder){ toast('This browser cannot record video (try Chrome/Edge)', true); return; }
+    const range = currentRange();
+    if(range.re - range.rs < 0.5){ toast('Pick a part of the video that is at least half a second long', true); return; }
     const btn = $('burnBtn'), progWrap = $('progWrap'), progBar = $('progBar'), statusEl = $('burnStatus');
     btn.disabled = true;
     progWrap.classList.add('show');
     statusEl.textContent = 'Preparing export…';
+    let recorderRef = null, restoreControls = null, visHandler = null;
 
     try{
       ensureAudioGraph();
@@ -1166,17 +1221,24 @@
       statusEl.textContent = `Exporting at ${W}×${H} — keep this tab open and in front…`;
       const onVis = ()=>{ if(document.hidden && exporting) toast('Keep this tab visible while exporting, or the video will freeze', true); };
       document.addEventListener('visibilitychange', onVis);
+      visHandler = onVis;
       const chunks = [];
       recorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
 
       const wasControls = video.controls;
       video.controls = false;
+      restoreControls = ()=>{ video.controls = wasControls; };
 
       const finished = new Promise(resolve=>{ recorder.onstop = resolve; });
 
-      video.currentTime = 0;
-      await new Promise(r=>{ video.onseeked = r; });
-      const ended = new Promise(r=>{ video.onended = r; });
+      let finishRange = null;
+      const playbackDone = new Promise(r=>{ finishRange = r; video.onended = r; });
+      video.currentTime = range.rs;
+      await new Promise(r=>{
+        let done = false; const fin = ()=>{ if(!done){ done = true; r(); } };
+        video.onseeked = fin; setTimeout(fin, 1500); // don't hang if the browser skips the event
+      });
+      recorderRef = recorder;
       recorder.start(250);
       await video.play();
 
@@ -1188,19 +1250,22 @@
       function loop(){
         if(stopLoop) return;
         const t = video.currentTime;
+        if(t >= range.re){ finishRange(); return; } // reached the end of the selected part
         ctx.drawImage(video, 0, 0, W, H);
         drawCaptionOnCanvas(ctx, W, H, pageAt(t), t);
         const now = performance.now();
         if(now - lastUi > 250){
           lastUi = now;
-          progBar.style.width = Math.min(100, (t/(video.duration||1))*100) + '%';
-          statusEl.textContent = `Rendering… ${fmtClock(t)} / ${fmtClock(video.duration||0)} — keep this tab in front`;
+          const span = range.re - range.rs;
+          progBar.style.width = Math.min(100, Math.max(0, (t - range.rs)/span*100)) + '%';
+          statusEl.textContent = `Rendering… ${fmtClock(Math.max(0, t - range.rs))} / ${fmtClock(span)} — keep this tab in front`;
         }
         if(useRVFC) video.requestVideoFrameCallback(loop); else raf = requestAnimationFrame(loop);
       }
       loop();
 
-      await ended;
+      await playbackDone;
+      video.pause();
       stopLoop = true;
       if(raf) cancelAnimationFrame(raf);
       document.removeEventListener('visibilitychange', onVis);
@@ -1213,19 +1278,23 @@
       const blob = new Blob(chunks, {type: outMime});
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'captioned_video_' + W + 'x' + H + '.' + ext;
+      a.download = 'captioned_video_' + W + 'x' + H + (range.full ? '' : '_clip') + '.' + ext;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(()=>URL.revokeObjectURL(a.href), 4000);
 
-      statusEl.textContent = `Done (${ext.toUpperCase()}) — check your downloads.`;
+      statusEl.textContent = range.full ? `Done (${ext.toUpperCase()}) — check your downloads.` : `Done — exported ${fmtClock(range.re - range.rs)} as ${ext.toUpperCase()}, check your downloads.`;
       progBar.style.width = '100%';
       toast('Captioned video downloaded');
     }catch(err){
       console.error(err);
       statusEl.textContent = '';
+      try{ video.pause(); }catch(e){}
+      try{ if(recorderRef && recorderRef.state !== 'inactive') recorderRef.stop(); }catch(e){}
       toast('Export failed — this usually means the video source blocks canvas capture (try an uploaded file instead of a URL)', true);
     }finally{
       exporting = false;
+      if(restoreControls) restoreControls();
+      if(visHandler) document.removeEventListener('visibilitychange', visHandler);
       btn.disabled = false;
       setTimeout(()=>{ progWrap.classList.remove('show'); progBar.style.width='0%'; }, 1500);
     }
