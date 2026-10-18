@@ -320,9 +320,13 @@
             <option value="base" selected>Base — balanced</option>
             <option value="small">Small — most accurate, slower</option>
           </select>
-          <select id="asrTiming" title="How precisely each word is timed">
-            <option value="word" selected>Word timing (auto-fallback)</option>
-            <option value="segment">Phrase timing (most dependable)</option>
+          <select id="asrTiming" title="How the speech is timed. Phrase timing is the most dependable. Word timing is experimental and falls back to phrase timing if it looks wrong.">
+            <option value="segment" selected>Phrase timing (most dependable)</option>
+            <option value="word">Word timing (experimental)</option>
+          </select>
+          <select id="asrEngine" title="Which version of the speech engine to use. Stable is the version that has been working. Newer is experimental, so try it on a short clip first.">
+            <option value="stable" selected>Engine: Stable</option>
+            <option value="next">Engine: Newer (experimental)</option>
           </select>
         </div>
         <div class="hint" id="asrStatus">Runs fully in your browser using Whisper — no upload, no account. First run downloads the model (~40–250MB depending on size); it's cached after that. Works best in Chrome/Edge. Only works when you've opened this file directly, not the in-chat preview.</div>
@@ -1353,31 +1357,42 @@
     return out;
   }
 
-  let asrWorker = null;
-  function getAsrWorker(){
+  let asrWorker = null, asrWorkerEngine = null;
+  function getAsrWorker(engine){
+    // Each engine version gets its own worker, so the two never share state.
+    if(asrWorker && asrWorkerEngine !== engine){ asrWorker.terminate(); asrWorker = null; }
     if(!asrWorker){
       asrWorker = new Worker('asr-worker.js', {type:'module'});
+      asrWorkerEngine = engine;
     }
     return asrWorker;
   }
-  function runWhisperInWorker(pcm, modelSize, timing, onEvent){
+  function runWhisperInWorker(pcm, modelSize, timing, engine, onEvent){
     return new Promise((resolve, reject)=>{
-      const worker = getAsrWorker();
+      const worker = getAsrWorker(engine);
+      const cleanup = ()=>{ worker.removeEventListener('message', handler); worker.removeEventListener('error', onCrash); };
       function handler(e){
         const msg = e.data;
         if(msg.type === 'done'){
-          worker.removeEventListener('message', handler);
-          resolve({result: msg.result, mode: msg.mode, timingOk: msg.timingOk});
+          cleanup();
+          resolve({result: msg.result, mode: msg.mode, timingOk: msg.timingOk, engine: msg.engine});
         }else if(msg.type === 'error'){
-          worker.removeEventListener('message', handler);
+          cleanup();
           reject(new Error(msg.message));
         }else{
           onEvent && onEvent(msg);
         }
       }
+      // If the worker itself fails to start (for example the script can't load), don't wait forever.
+      function onCrash(ev){
+        cleanup();
+        asrWorker = null; // start fresh next time
+        reject(new Error((ev && ev.message) ? ev.message : 'The speech worker stopped unexpectedly'));
+      }
       worker.addEventListener('message', handler);
+      worker.addEventListener('error', onCrash);
       // Transfer the buffer instead of copying it — cheap even for long audio.
-      worker.postMessage({type:'transcribe', modelSize, pcm, timing}, [pcm.buffer]);
+      worker.postMessage({type:'transcribe', modelSize, pcm, timing, engine}, [pcm.buffer]);
     });
   }
   function segmentsToCues(chunks, totalDur){
@@ -1466,7 +1481,8 @@
       // Runs in a Web Worker (a background thread) so the page — video preview, buttons,
       // this status text — stays fully responsive instead of freezing during transcription.
       const timing = $('asrTiming').value;
-      const out = await runWhisperInWorker(pcm, modelSize, timing, (msg)=>{
+      const engine = $('asrEngine').value;
+      const out = await runWhisperInWorker(pcm, modelSize, timing, engine, (msg)=>{
         if(msg.type === 'progress'){
           phase = `Downloading model (${msg.file || 'weights'}) ${Math.round(msg.progress||0)}%…`;
         }else if(msg.type === 'status'){
@@ -1489,7 +1505,7 @@
       renderCues();
       setStep(3);
       const usedFallback = (timing === 'word' && out.mode === 'segment');
-      statusEl.textContent = `Transcribed ${cues.length} captions with Whisper (${modelSize}) in ${fmtElapsed(Date.now()-startedAt)}` +
+      statusEl.textContent = `Transcribed ${cues.length} captions with Whisper (${modelSize}${engine === 'next' ? ', newer engine' : ''}) in ${fmtElapsed(Date.now()-startedAt)}` +
         (usedFallback ? ' — word timing was unreliable on this clip, so phrase timing was used.' : '.');
       if(!out.timingOk || collapsedShare(cues) > 0.3){
         toast('The timing still looks wrong on this clip. Try the Small model, or transcribe with Subtitle Edit and import the .srt.', true);
